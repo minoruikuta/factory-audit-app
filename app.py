@@ -4,8 +4,9 @@ import openpyxl
 import google.generativeai as genai
 import io
 import json
+import time
 
-# --- 設定 ---
+# --- 基本設定 ---
 st.set_page_config(page_title="工場監査表 AIチェックツール", page_icon="📋", layout="wide")
 
 st.sidebar.header("初期設定")
@@ -55,28 +56,42 @@ if uploaded_file is not None and model is not None:
 
     if st.session_state.processed_data is None:
         if st.button("AIチェックを実行する", type="primary"):
-            with st.spinner("AIが一括チェックしています...（約5秒で完了します）"):
-                # 対象行の抽出
-                items_to_check = []
-                for row_idx in range(9, sheet.max_row + 1):
-                    target_col = 9
-                    cell_value = sheet.cell(row=row_idx, column=target_col).value
-                    if cell_value and isinstance(cell_value, str):
-                        orig = cell_value.strip()
-                        if len(orig) > 2 and orig not in ["該当無し", "該当なし", "ー", "該当なし。"]:
-                            items_to_check.append({
-                                "row": row_idx,
-                                "col": target_col,
-                                "original": orig
-                            })
+            # 1. チェック対象行の抽出
+            items_to_check = []
+            for row_idx in range(9, sheet.max_row + 1):
+                target_col = 9
+                cell_value = sheet.cell(row=row_idx, column=target_col).value
+                if cell_value and isinstance(cell_value, str):
+                    orig = cell_value.strip()
+                    if len(orig) > 2 and orig not in ["該当無し", "該当なし", "ー", "該当なし。"]:
+                        items_to_check.append({
+                            "row": row_idx,
+                            "col": target_col,
+                            "original": orig
+                        })
 
-                if not items_to_check:
-                    st.warning("チェック対象となるテキストが見つかりませんでした。")
-                else:
-                    # まとめて1回で送るプロンプト
-                    input_json = json.dumps([{"row": item["row"], "text": item["original"]} for item in items_to_check], ensure_ascii=False, indent=2)
+            total_items = len(items_to_check)
+            if total_items == 0:
+                st.warning("チェック対象となる記述が見つかりませんでした。")
+            else:
+                progress_bar = st.progress(0, text=f"チェック対象 {total_items}件 を検出しました。高速チェックを開始します...")
+                
+                # 10件ずつの小分け（バッチ）に分割
+                batch_size = 10
+                batches = [items_to_check[i:i + batch_size] for i in range(0, total_items, batch_size)]
+                total_batches = len(batches)
+                
+                all_results = []
+                
+                for b_idx, batch in enumerate(batches):
+                    current_batch_num = b_idx + 1
+                    percent = int((b_idx / total_batches) * 100)
+                    progress_bar.progress(percent, text=f"高速チェック中: {min((b_idx + 1) * batch_size, total_items)} / {total_items}件 完了...")
                     
-                    full_prompt = f"""あなたは食品工場の品質保証・監査報告書の専門校正担当です。
+                    input_data = [{"row": item["row"], "text": item["original"]} for item in batch]
+                    input_json = json.dumps(input_data, ensure_ascii=False)
+                    
+                    prompt = f"""あなたは食品工場の品質保証・監査報告書の専門校正担当です。
 以下の【校正基準】に基づき、入力された各行のテキストを厳格に校正してください。
 
 {system_rules}
@@ -85,35 +100,40 @@ if uploaded_file is not None and model is not None:
 {input_json}
 
 【出力形式】
-修正が必要な項目のみを抽出し、以下のJSON配列形式で出力してください。修正が不要な項目は配列に含めないでください。
+修正が必要な項目のみを抽出し、以下のJSON配列形式で出力してください。修正不要な行は含めないでください。
 [
   {{"row": 行番号, "suggested": "修正後の文章"}}
 ]
 """
                     try:
                         generation_config = {"response_mime_type": "application/json"}
-                        response = model.generate_content(full_prompt, generation_config=generation_config)
-                        parsed_suggestions = json.loads(response.text.strip())
+                        res = model.generate_content(prompt, generation_config=generation_config)
+                        res_text = res.text.strip()
+                        if res_text.startswith("```json"):
+                            res_text = res_text.replace("```json", "").replace("```", "").strip()
                         
-                        suggestion_dict = {item["row"]: item["suggested"] for item in parsed_suggestions if "row" in item and "suggested" in item}
+                        parsed = json.loads(res_text)
+                        sugg_map = {p["row"]: p["suggested"] for p in parsed if "row" in p and "suggested" in p}
                         
-                        results = []
-                        for item in items_to_check:
-                            if item["row"] in suggestion_dict:
-                                results.append({
+                        for item in batch:
+                            if item["row"] in sugg_map:
+                                all_results.append({
                                     "row": item["row"],
                                     "col": item["col"],
                                     "original": item["original"],
-                                    "suggested": suggestion_dict[item["row"]],
+                                    "suggested": sugg_map[item["row"]],
                                     "apply": True
                                 })
-
-                        st.session_state.processed_data = results
-                        st.success(f"チェック完了！ {len(results)}件の修正案が見つかりました。")
-                        st.rerun()
-
                     except Exception as e:
-                        st.error(f"AIチェック中にエラーが発生しました: {e}")
+                        st.warning(f"グループ {current_batch_num} の処理中に軽微なスキップが発生しました: {e}")
+                    
+                    time.sleep(0.2)
+
+                progress_bar.progress(100, text="すべてのチェックが完了しました！")
+                st.session_state.processed_data = all_results
+                st.success(f"チェック完了！ 合計 {len(all_results)}件の修正案が見つかりました。")
+                time.sleep(0.8)
+                st.rerun()
 
     # 結果の表示とダウンロード
     if st.session_state.processed_data is not None:
