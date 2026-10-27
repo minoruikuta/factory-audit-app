@@ -4,7 +4,7 @@ import openpyxl
 import google.generativeai as genai
 import io
 import json
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- 基本設定 ---
 st.set_page_config(page_title="工場監査表 AIチェックツール", page_icon="📋", layout="wide")
@@ -42,6 +42,31 @@ with st.expander("⚙️ AIチェックルール（クリックで確認・編�
 
 uploaded_file = st.file_uploader("監査表Excelファイル（.xlsx）をアップロード", type=["xlsx"])
 
+def check_batch(batch, rules_text, model_instance):
+    input_data = [{"row": item["row"], "text": item["original"]} for item in batch]
+    input_json = json.dumps(input_data, ensure_ascii=False)
+    prompt = f"""あなたは食品工場の品質保証・監査報告書の専門校正担当です。
+以下の【校正基準】に基づき、入力された各行のテキストを厳格に校正してください。
+
+{rules_text}
+
+【入力データ】
+{input_json}
+
+【出力形式】
+修正が必要な項目のみを抽出し、以下のJSON配列形式で出力してください。修正不要な行は含めないでください。
+[
+  {{"row": 行番号, "suggested": "修正後の文章"}}
+]
+"""
+    generation_config = {"response_mime_type": "application/json", "temperature": 0.1}
+    res = model_instance.generate_content(prompt, generation_config=generation_config)
+    res_text = res.text.strip()
+    if res_text.startswith("```json"):
+        res_text = res_text.replace("```json", "").replace("```", "").strip()
+    parsed = json.loads(res_text)
+    return {p["row"]: p["suggested"] for p in parsed if isinstance(p, dict) and "row" in p and "suggested" in p}
+
 if uploaded_file is not None and model is not None:
     if 'processed_data' not in st.session_state or st.session_state.uploaded_filename != uploaded_file.name:
         st.session_state.processed_data = None
@@ -56,7 +81,6 @@ if uploaded_file is not None and model is not None:
 
     if st.session_state.processed_data is None:
         if st.button("AIチェックを実行する", type="primary"):
-            # 1. チェック対象行の抽出
             items_to_check = []
             for row_idx in range(9, sheet.max_row + 1):
                 target_col = 9
@@ -74,68 +98,50 @@ if uploaded_file is not None and model is not None:
             if total_items == 0:
                 st.warning("チェック対象となる記述が見つかりませんでした。")
             else:
-                progress_bar = st.progress(0, text=f"チェック対象 {total_items}件 を検出しました。高速チェックを開始します...")
+                progress_bar = st.progress(0, text="高速並列チェックを開始しています...")
                 
-                # 10件ずつの小分け（バッチ）に分割
-                batch_size = 10
+                batch_size = 15
                 batches = [items_to_check[i:i + batch_size] for i in range(0, total_items, batch_size)]
                 total_batches = len(batches)
                 
-                all_results = []
+                all_suggestions = {}
+                completed_batches = 0
                 
-                for b_idx, batch in enumerate(batches):
-                    current_batch_num = b_idx + 1
-                    percent = int((b_idx / total_batches) * 100)
-                    progress_bar.progress(percent, text=f"高速チェック中: {min((b_idx + 1) * batch_size, total_items)} / {total_items}件 完了...")
+                # 3並列で同時にAIへ通信
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    future_to_batch = {
+                        executor.submit(check_batch, batch, system_rules, model): batch
+                        for batch in batches
+                    }
                     
-                    input_data = [{"row": item["row"], "text": item["original"]} for item in batch]
-                    input_json = json.dumps(input_data, ensure_ascii=False)
-                    
-                    prompt = f"""あなたは食品工場の品質保証・監査報告書の専門校正担当です。
-以下の【校正基準】に基づき、入力された各行のテキストを厳格に校正してください。
-
-{system_rules}
-
-【入力データ】
-{input_json}
-
-【出力形式】
-修正が必要な項目のみを抽出し、以下のJSON配列形式で出力してください。修正不要な行は含めないでください。
-[
-  {{"row": 行番号, "suggested": "修正後の文章"}}
-]
-"""
-                    try:
-                        generation_config = {"response_mime_type": "application/json"}
-                        res = model.generate_content(prompt, generation_config=generation_config)
-                        res_text = res.text.strip()
-                        if res_text.startswith("```json"):
-                            res_text = res_text.replace("```json", "").replace("```", "").strip()
+                    for future in as_completed(future_to_batch):
+                        try:
+                            batch_result = future.result()
+                            all_suggestions.update(batch_result)
+                        except Exception as e:
+                            st.warning(f"一部グループの処理で警告が出ました: {e}")
                         
-                        parsed = json.loads(res_text)
-                        sugg_map = {p["row"]: p["suggested"] for p in parsed if "row" in p and "suggested" in p}
-                        
-                        for item in batch:
-                            if item["row"] in sugg_map:
-                                all_results.append({
-                                    "row": item["row"],
-                                    "col": item["col"],
-                                    "original": item["original"],
-                                    "suggested": sugg_map[item["row"]],
-                                    "apply": True
-                                })
-                    except Exception as e:
-                        st.warning(f"グループ {current_batch_num} の処理中に軽微なスキップが発生しました: {e}")
-                    
-                    time.sleep(0.2)
+                        completed_batches += 1
+                        pct = int((completed_batches / total_batches) * 100)
+                        progress_bar.progress(pct, text=f"進捗: {completed_batches}/{total_batches} グループ完了 ({pct}%)")
 
-                progress_bar.progress(100, text="すべてのチェックが完了しました！")
+                all_results = []
+                for item in items_to_check:
+                    if item["row"] in all_suggestions:
+                        all_results.append({
+                            "row": item["row"],
+                            "col": item["col"],
+                            "original": item["original"],
+                            "suggested": all_suggestions[item["row"]],
+                            "apply": True
+                        })
+
+                progress_bar.progress(100, text="チェック完了！")
                 st.session_state.processed_data = all_results
                 st.success(f"チェック完了！ 合計 {len(all_results)}件の修正案が見つかりました。")
-                time.sleep(0.8)
                 st.rerun()
 
-    # 結果の表示とダウンロード
+    # 結果一覧とダウンロード
     if st.session_state.processed_data is not None:
         st.subheader("🔍 チェック結果一覧と適用")
         st.caption("チェック（✅）が入っている項目のみ、出力されるExcelファイルに修正が反映されます。")
