@@ -15,24 +15,14 @@ api_key = st.sidebar.text_input("Gemini APIキーを入力してください", t
 model = None
 if api_key:
     genai.configure(api_key=api_key)
-    # 利用可能なFlashモデルを優先して自動検出・設定
-    candidate_models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash-latest', 'gemini-1.5-pro']
-    selected_model_name = candidate_models[0]
+    # 最新モデル gemini-3.8-flash を指定
+    selected_model_name = 'gemini-3.8-flash'
     
     try:
-        available = [m.name.replace('models/', '') for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        for cand in candidate_models:
-            if cand in available:
-                selected_model_name = cand
-                break
-        else:
-            if available:
-                selected_model_name = available[0]
-    except Exception:
-        pass
-
-    model = genai.GenerativeModel(selected_model_name)
-    st.sidebar.success(f"接続完了: {selected_model_name}")
+        model = genai.GenerativeModel(selected_model_name)
+        st.sidebar.success(f"接続完了: {selected_model_name}")
+    except Exception as e:
+        st.sidebar.error(f"モデル接続エラー: {e}")
 else:
     st.sidebar.warning("APIキーを入力すると機能が有効になります。")
 
