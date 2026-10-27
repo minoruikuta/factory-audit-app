@@ -12,9 +12,27 @@ st.set_page_config(page_title="工場監査表 AIチェックツール", page_ic
 st.sidebar.header("初期設定")
 api_key = st.sidebar.text_input("Gemini APIキーを入力してください", type="password")
 
+model = None
 if api_key:
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # 利用可能なFlashモデルを優先して自動検出・設定
+    candidate_models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash-latest', 'gemini-1.5-pro']
+    selected_model_name = candidate_models[0]
+    
+    try:
+        available = [m.name.replace('models/', '') for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        for cand in candidate_models:
+            if cand in available:
+                selected_model_name = cand
+                break
+        else:
+            if available:
+                selected_model_name = available[0]
+    except Exception:
+        pass
+
+    model = genai.GenerativeModel(selected_model_name)
+    st.sidebar.success(f"接続完了: {selected_model_name}")
 else:
     st.sidebar.warning("APIキーを入力すると機能が有効になります。")
 
@@ -49,7 +67,7 @@ with st.expander("⚙️ AIチェックルール・プロンプト設定（ク�
 # --- ファイルアップロードと処理 ---
 uploaded_file = st.file_uploader("監査表Excelファイル（.xlsx）をアップロード", type=["xlsx"])
 
-if uploaded_file is not None and api_key:
+if uploaded_file is not None and model is not None:
     if 'processed_data' not in st.session_state or st.session_state.uploaded_filename != uploaded_file.name:
         st.session_state.processed_data = None
         st.session_state.uploaded_filename = uploaded_file.name
